@@ -1,0 +1,214 @@
+diff --git a/src/install/installer.rs b/src/install/installer.rs
+index 7e400d95..3d796379 100644
+--- a/src/install/installer.rs
++++ b/src/install/installer.rs
+@@ -3003,7 +3003,7 @@ pub(crate) async fn fetch_verified_layer_within(
+         // A layer the run already decoded is reused without a fetch, a
+         // decode or a charge: two pins sharing one good layer prove from
+         // the same bytes (#368).
+-        if let Some(decoded) = budget.cached(&layer_digest) {
++        if let Some(decoded) = budget.cached(layer) {
+             return Ok((*decoded).clone());
+         }
+         if layer.size > budget.remaining() {
+@@ -3042,7 +3042,7 @@ pub(crate) async fn fetch_verified_layer_within(
+         budget.note_failed(layer_digest.clone());
+         crate::error::Error::from(e)
+     })?;
+-    budget.cache(layer_digest, decoded.clone());
++    budget.cache(layer.clone(), decoded.clone());
+     Ok(decoded)
+ }
+ 
+@@ -10255,6 +10255,79 @@ mod tests {
+         )]))
+     }
+ 
++    /// Sharing blob bytes must not share a decode across different media types.
++    #[tokio::test]
++    async fn shared_layer_cache_respects_media_type() {
++        let reg = crate::oci::access::memory_registry::MemoryRegistry::new();
++        let tar = skill_tar("shared", SKILL_DOC);
++        let plain = locked_layer(
++            &reg,
++            "plain",
++            ArtifactKind::Skill,
++            &tar,
++            crate::oci::layer::TAR_LAYER_MEDIA_TYPE,
++            None,
++        )
++        .await;
++        let gzip = locked_layer(
++            &reg,
++            "gzip",
++            ArtifactKind::Skill,
++            &tar,
++            crate::oci::layer::TAR_GZIP_LAYER_MEDIA_TYPE,
++            None,
++        )
++        .await;
++        let access = arc(reg);
++        let budget = DecodeBudget::with_limit(100_000);
++        fetch_verified_layer_within(&plain, ArtifactKind::Skill, &access, Some(&budget))
++            .await
++            .expect("raw layer decodes");
++        let err = fetch_verified_layer_within(&gzip, ArtifactKind::Skill, &access, Some(&budget))
++            .await
++            .expect_err("the same tar bytes are not gzip");
++        assert!(err.to_string().contains("not valid single-member gzip"), "{err}");
++    }
++
++    /// A cached gzip decode must not bypass another descriptor's digest annotation.
++    #[tokio::test]
++    async fn shared_layer_cache_respects_uncompressed_digest_annotation() {
++        let reg = crate::oci::access::memory_registry::MemoryRegistry::new();
++        let tar = skill_tar("shared", SKILL_DOC);
++        let (blob, _) = crate::oci::layer::encode_layer(&tar, crate::oci::layer::Compression::Gzip);
++        let valid = locked_layer(
++            &reg,
++            "valid",
++            ArtifactKind::Skill,
++            &blob,
++            crate::oci::layer::TAR_GZIP_LAYER_MEDIA_TYPE,
++            sha256_annotation(&Algorithm::Sha256.hash(&tar).to_string()),
++        )
++        .await;
++        let invalid = locked_layer(
++            &reg,
++            "invalid",
++            ArtifactKind::Skill,
++            &blob,
++            crate::oci::layer::TAR_GZIP_LAYER_MEDIA_TYPE,
++            sha256_annotation(&Algorithm::Sha256.hash(b"not the tar").to_string()),
++        )
++        .await;
++        let access = arc(reg);
++        let budget = DecodeBudget::with_limit(100_000);
++        fetch_verified_layer_within(&valid, ArtifactKind::Skill, &access, Some(&budget))
++            .await
++            .expect("valid annotation decodes");
++        let err = fetch_verified_layer_within(&invalid, ArtifactKind::Skill, &access, Some(&budget))
++            .await
++            .expect_err("a cached layer must not bypass the mismatched annotation");
++        assert!(
++            err.to_string()
++                .contains("does not match com.grimoire.uncompressed.digest"),
++            "{err}"
++        );
++    }
++
+     #[tokio::test]
+     async fn gzip_registry_skill_stages_the_decoded_tree() {
+         let tmp = tempfile::tempdir().unwrap();
+diff --git a/src/oci/access/bounded_access.rs b/src/oci/access/bounded_access.rs
+index 8e8c9ab3..b8cde679 100644
+--- a/src/oci/access/bounded_access.rs
++++ b/src/oci/access/bounded_access.rs
+@@ -20,7 +20,7 @@ use tokio::time::Instant;
+ 
+ use super::super::access::{CatalogListing, OciAccess, Operation, TagListing};
+ use super::error::{AccessError, AccessErrorKind};
+-use crate::oci::manifest::OciManifest;
++use crate::oci::manifest::{Descriptor, OciManifest};
+ use crate::oci::{Digest, Identifier, PinnedIdentifier};
+ 
+ /// How long one call may take before its host counts as failed.
+@@ -50,9 +50,9 @@ struct Decoded {
+     used: u64,
+     /// Layers whose decode failed in this run.
+     failed: BTreeSet<Digest>,
+-    /// Layers this run already decoded, by digest: the decoded tar bytes.
++    /// Layers this run already decoded, with the full descriptor used to decode.
+     /// Bounded by the budget itself, since a stored layer was charged once.
+-    layers: BTreeMap<Digest, Arc<Vec<u8>>>,
++    layers: BTreeMap<Digest, (Descriptor, Arc<Vec<u8>>)>,
+ }
+ 
+ impl DecodeBudget {
+@@ -102,15 +102,21 @@ impl DecodeBudget {
+         self.decoded().failed.insert(digest);
+     }
+ 
+-    /// The decoded tar bytes of the layer `digest`, when this run already decoded it.
+-    pub fn cached(&self, digest: &Digest) -> Option<Arc<Vec<u8>>> {
+-        self.decoded().layers.get(digest).cloned()
++    /// The decoded tar bytes, only when the full descriptor matches the prior decode.
++    pub fn cached(&self, descriptor: &Descriptor) -> Option<Arc<Vec<u8>>> {
++        self.decoded()
++            .layers
++            .get(&descriptor.digest)
++            .filter(|(cached, _)| cached == descriptor)
++            .map(|(_, bytes)| Arc::clone(bytes))
+     }
+ 
+-    /// Remembers the decoded tar bytes of the layer `digest`, so a second
+-    /// pin sharing the layer reuses them without a fetch, a decode or a charge.
+-    pub fn cache(&self, digest: Digest, bytes: Vec<u8>) {
+-        self.decoded().layers.insert(digest, Arc::new(bytes));
++    /// Remembers the descriptor with its decoded bytes. A digest identifies the blob,
++    /// but its media type and annotations also control decoding and validation.
++    pub fn cache(&self, descriptor: Descriptor, bytes: Vec<u8>) {
++        self.decoded()
++            .layers
++            .insert(descriptor.digest.clone(), (descriptor, Arc::new(bytes)));
+     }
+ 
+     fn decoded(&self) -> MutexGuard<'_, Decoded> {
+@@ -445,6 +451,37 @@ mod tests {
+     use crate::oci::Algorithm;
+     use crate::oci::access::memory_registry::MemoryRegistry;
+ 
++    /// All descriptor fields participate in reuse, even when blob bytes match.
++    #[test]
++    fn decoded_cache_requires_the_full_descriptor() {
++        let budget = DecodeBudget::with_limit(100);
++        let descriptor = Descriptor {
++            digest: Algorithm::Sha256.hash(b"blob"),
++            media_type: crate::oci::layer::TAR_LAYER_MEDIA_TYPE.to_string(),
++            size: 4,
++            annotations: None,
++        };
++        budget.charge(3).unwrap();
++        budget.cache(descriptor.clone(), vec![1, 2, 3]);
++        let remaining = budget.remaining();
++        assert_eq!(*budget.cached(&descriptor).unwrap(), vec![1, 2, 3]);
++        assert!(budget.clone().cached(&descriptor).is_some());
++        assert_eq!(budget.remaining(), remaining, "reuse is not charged again");
++
++        let mut media_type = descriptor.clone();
++        media_type.media_type = crate::oci::layer::TAR_GZIP_LAYER_MEDIA_TYPE.to_string();
++        assert!(budget.cached(&media_type).is_none());
++        let mut size = descriptor.clone();
++        size.size += 1;
++        assert!(budget.cached(&size).is_none());
++        let mut annotations = descriptor;
++        annotations.annotations = Some(BTreeMap::from([(
++            crate::oci::layer::UNCOMPRESSED_DIGEST_ANNOTATION.to_string(),
++            Algorithm::Sha256.hash(b"other").to_string(),
++        )]));
++        assert!(budget.cached(&annotations).is_none());
++    }
++
+     /// How a scripted host answers a call.
+     #[derive(Clone, Copy)]
+     enum Answer {
+diff --git a/test/taskfile.yml b/test/taskfile.yml
+index 429415d3..74ae852e 100644
+--- a/test/taskfile.yml
++++ b/test/taskfile.yml
+@@ -122,14 +122,7 @@ tasks:
+       REPORT: results/old-grim/junit.xml
+     preconditions:
+       - sh: test -n "$GRIM_OLD_BIN"
+-        msg: >-
+-          GRIM_OLD_BIN must name the grim binary from the v0.15.1 release.
+-          Download https://github.com/grimoire-rs/grimoire/releases/download/v0.15.1/grimoire-<target>.tar.gz
+-          (for example grimoire-x86_64-unknown-linux-gnu.tar.gz), check it against the release's
+-          own .sha256 asset (the x86_64 Linux asset's pinned SHA-256 is
+-          eec30a069ce12239058b54a9e986340cc2a3db9662504ab5ca467f8167d802c0), extract grim and
+-          export GRIM_OLD_BIN=<path>/grim. The deep CI job (.github/workflows/verify-deep.yml,
+-          "Fetch grim 0.15.1") does exactly this; a dev build that prints 0.15.1 is refused.
++        msg: GRIM_OLD_BIN must name the grim binary from the v0.15.1 release (grimoire-<target>.tar.gz)
+     cmds:
+       - task: build
+         vars:
